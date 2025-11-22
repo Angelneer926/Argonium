@@ -9,13 +9,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-
+import xml.etree.ElementTree as ET
 import requests
 import yaml
 from openai import OpenAI, OpenAIError
 
 # Base URL for Semantic Scholar API
-BASE_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
+ARXIV_BASE_URL = "http://export.arxiv.org/api/query"
 FIELDS = "title,authors,year,externalIds,url,venue,openAccessPdf,abstract,paperId"
 
 # Optional imports for PDF validation
@@ -332,89 +332,93 @@ def sanitize_filename(name):
     return "".join(c for c in name if c.isalnum() or c in (" ", ".", "_")).rstrip()
 
 
-def search_papers(keyword, api_key, limit=100, offset=0):
+def parse_arxiv_response(xml_text):
+    """Parse arXiv ATOM XML into a Semantic Scholar-like dict format."""
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(xml_text)
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+
+    results = []
+    for entry in root.findall("atom:entry", ns):
+        full_id = entry.find("atom:id", ns).text
+        # arXiv id like: http://arxiv.org/abs/2401.12345
+        arxiv_id = full_id.split("/")[-1]  # 2401.12345
+
+        # create a pseudo Semantic Scholar-style paperId
+        paper_id = f"arXiv:{arxiv_id}"
+
+        paper = {
+            "paperId": paper_id,  # <---- ⭐关键：主程序不再跳过
+            "title": entry.find("atom:title", ns).text.strip(),
+            "abstract": entry.find("atom:summary", ns).text.strip(),
+            "year": entry.find("atom:published", ns).text[:4],
+            "authors": [
+                {"name": a.find("atom:name", ns).text}
+                for a in entry.findall("atom:author", ns)
+            ],
+            "venue": "arXiv",
+            "openAccessPdf": {
+                "url": f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+            },  # <---- ⭐自动补上 PDF 下载链接
+            "url": f"https://arxiv.org/abs/{arxiv_id}",
+        }
+
+        results.append(paper)
+
+    return {"data": results}
+
+
+def search_papers(keyword, limit=100, offset=0):
     """
-    Search papers for a given 'keyword' using the Semantic Scholar API.
-    Returns the JSON response if successful, otherwise None.
-    Includes diagnostic prints for debugging.
-
-    Args:
-        keyword (str): The search term.
-        api_key (str | None): The Semantic Scholar API key.
-        limit (int): Max results per request.
-        offset (int): Starting offset for results.
-
-    Returns:
-        dict | None: The JSON response from the API or None on failure.
+    Search papers on arXiv for a given 'keyword'.
+    Preserves the debug + retry logic of your original code.
     """
-    url = BASE_URL
-    params = {"query": keyword, "limit": limit, "offset": offset, "fields": FIELDS}
-    headers = {}
-    if api_key:
-        headers["x-api-key"] = api_key
+    url = ARXIV_BASE_URL
+    params = {
+        "search_query": f"all:{keyword}",
+        "start": offset,
+        "max_results": limit,
+        "sortBy": "relevance",
+        "sortOrder": "descending",
+    }
 
-    # Print debug info about the request
     print("-" * 50)
-    print(f"Debug Info: Attempting to retrieve papers with:")
+    print(f"Debug Info: Attempting arXiv search with:")
     print(f"  Keyword: {keyword}")
     print(f"  URL: {url}")
     print(f"  Parameters: {params}")
-    if api_key:
-        print(f"  Using SS API key: {api_key[:4]}... (truncated)")
-    else:
-        print("  No SS API key provided.")
+    print("  (arXiv does not require API key)")
     print("-" * 50)
 
     max_retries = 5
-    backoff_time = 5  # Start with 5 seconds
+    backoff_time = 5
 
     for attempt in range(1, max_retries + 1):
         try:
-            response = requests.get(
-                url, params=params, headers=headers, timeout=30
-            )  # Added timeout
+            response = requests.get(url, params=params, timeout=30)
             print(f"Request URL (final): {response.url}")
             print(f"Response status code: {response.status_code}")
 
             if response.status_code == 200:
                 print(f"Successfully fetched data on attempt {attempt}")
-                return response.json()
-            elif response.status_code == 429:
-                print(
-                    f"Rate limit exceeded (attempt {attempt}). "
-                    f"Retrying after {backoff_time} seconds..."
-                )
-                time.sleep(backoff_time)
-                backoff_time *= 2  # Exponential backoff
-            elif response.status_code == 403:
-                print(
-                    f"Error: Forbidden (403). Check your API key permissions or usage limits. Attempt {attempt}."
-                )
-                # Stop retrying on 403
-                return None
+                return parse_arxiv_response(response.text)
             else:
-                print(
-                    f"Error: Unexpected status code {response.status_code} on attempt {attempt}."
-                )
-                print(f"Response text: {response.text[:200]} ...")
-                # Consider stopping retry for certain errors, maybe based on status code ranges
-                # For now, returning None after first failure for non-429 errors
+                print(f"Error: Unexpected status {response.status_code}")
+                print(f"Response head: {response.text[:200]} ...")
                 return None
 
         except requests.exceptions.Timeout:
-            print(
-                f"Request timed out on attempt {attempt}. Retrying after {backoff_time} seconds..."
-            )
-            time.sleep(backoff_time)
-            backoff_time *= 2
-        except requests.exceptions.RequestException as e:
-            print(f"Network or request error on attempt {attempt}: {e}")
+            print(f"Timeout on attempt {attempt}. Retrying in {backoff_time}s...")
             time.sleep(backoff_time)
             backoff_time *= 2
 
-    print(
-        f"Failed to fetch papers for keyword '{keyword}' after {max_retries} retries."
-    )
+        except requests.exceptions.RequestException as e:
+            print(f"Network error on attempt {attempt}: {e}")
+            time.sleep(backoff_time)
+            backoff_time *= 2
+
+    print(f"Failed to fetch arXiv papers for keyword '{keyword}' after retries.")
     return None
 
 
@@ -934,7 +938,7 @@ def main():
         for offset in range(0, total_papers_to_fetch, fetch_limit):
             print(f"Fetching papers (offset={offset})...")
             data = search_papers(
-                keyword, api_key=ss_api_key, limit=fetch_limit, offset=offset
+                keyword,  limit=fetch_limit, offset=offset
             )
 
             if data and "data" in data:
